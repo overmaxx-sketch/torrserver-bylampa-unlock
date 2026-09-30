@@ -1,10 +1,10 @@
-name: Check Upstream Release
+name: Sync Upstream Release
 
 on:
   workflow_dispatch:
 
   schedule:
-    - cron: "0 */1 * * *"
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
@@ -13,8 +13,15 @@ concurrency:
   group: upstream-release-check
   cancel-in-progress: false
 
+env:
+  UPSTREAM_REPO: "YouROK/TorrServer"
+  MIN_VERSION: "MatriX.144.1"
+  PATCH_FILE: "server/web/waf/referer.go"
+  BLOCKED_PATTERN: "bylampa"
+  DOCKER_WORKFLOW: ".github/workflows/docker_image.yml"
+
 jobs:
-  check:
+  sync:
     runs-on: ubuntu-latest
 
     steps:
@@ -25,7 +32,6 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           set -euo pipefail
-
           for wf in "ts_release.yml" "docker_image.yml"; do
             ACTIVE=$(
               gh run list --workflow="$wf" \
@@ -34,12 +40,11 @@ jobs:
                 --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length'
             )
             if [ "$ACTIVE" -gt 0 ]; then
-              echo "⚠️ Workflow '$wf' is running or queued ($ACTIVE run(s)). Skipping this run."
+              echo "⚠️ Workflow '$wf' is running or queued ($ACTIVE run(s)). Skipping."
               echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           done
-
           echo "✅ No conflicting workflows found."
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
@@ -48,6 +53,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          fetch-tags: true
           token: ${{ secrets.PAT_TOKEN }}
 
       - name: Find missing upstream releases
@@ -59,11 +65,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          MIN_VERSION="MatriX.144.1"
-
           UPSTREAM_TAGS=$(
             curl -fsSL \
-              "https://api.github.com/repos/YouROK/TorrServer/releases?per_page=100" |
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=100" |
             jq -r '[.[] | select(.prerelease == false) | .tag_name] | .[]'
           )
 
@@ -87,7 +92,7 @@ jobs:
                 echo "Tag and release exist: $TARGET"
                 continue
               else
-                echo "Tag exists but release missing: $TARGET — will recreate in next step"
+                echo "Tag exists but release missing: $TARGET — will recreate"
               fi
             else
               echo "Missing: $TARGET"
@@ -103,16 +108,18 @@ jobs:
           echo "tags=$MISSING" >> "$GITHUB_OUTPUT"
 
           if [ -z "$MISSING" ]; then
-            echo "All upstream releases >= $MIN_VERSION already have bylampa tags."
+            echo "All upstream releases >= $MIN_VERSION already have bylampa tags and releases."
           else
             echo "Tags to create: $MISSING"
           fi
 
-      - name: Fetch upstream, apply patch, create and push tags
+      - name: Fetch upstream, apply patch, push tags and releases
         if: steps.guard.outputs.skip != 'true' && steps.missing.outputs.tags != ''
         shell: bash
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TAGS: ${{ steps.missing.outputs.tags }}
         run: |
           set -euo pipefail
 
@@ -122,31 +129,30 @@ jobs:
           git remote set-url origin \
             "https://x-access-token:${PAT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
-          # Добавляем remote оригинала
-          git remote add upstream https://github.com/YouROK/TorrServer.git 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
 
-          for TAG in ${{ steps.missing.outputs.tags }}; do
+          for TAG in $TAGS; do
             TARGET="${TAG}-bylampa"
             echo "=== Processing $TARGET ==="
 
-            # 1. Скачиваем чистый код из оригинала по тегу
+            # 1. Скачиваем чистый код из оригинала
             git fetch upstream "$TAG"
             git checkout FETCH_HEAD -- .
             git add -A
 
-            # Удаляем триггер по ветке master из docker_image.yml
-            if [ -f ".github/workflows/docker_image.yml" ]; then
-              sed -i '/branches:.*master/d' .github/workflows/docker_image.yml
-              sed -i '/^[[:space:]]*- master$/d' .github/workflows/docker_image.yml
+            # 2. Удаляем триггер по ветке master из docker_image.yml
+            if [ -f "$DOCKER_WORKFLOW" ]; then
+              sed -i '/branches:.*master/d' "$DOCKER_WORKFLOW"
+              sed -i '/^[[:space:]]*- master$/d' "$DOCKER_WORKFLOW"
               echo "✅ Removed branches trigger from docker_image.yml"
             fi
 
-            # 2. Удаляем блокировку bylampa из WAF
-            if [ -f "server/web/waf/referer.go" ]; then
-              sed -i '/bylampa/d' server/web/waf/referer.go
-              echo "✅ Patched: removed bylampa from referer.go"
+            # 3. Удаляем блокировку bylampa из WAF
+            if [ -f "$PATCH_FILE" ]; then
+              sed -i "/${BLOCKED_PATTERN}/d" "$PATCH_FILE"
+              echo "✅ Patched: removed ${BLOCKED_PATTERN} from ${PATCH_FILE}"
             else
-              echo "ℹ️ referer.go not found in $TAG — nothing to patch"
+              echo "ℹ️ ${PATCH_FILE} not found in $TAG — nothing to patch"
             fi
 
             git add -A
@@ -154,18 +160,33 @@ jobs:
               echo "Nothing to commit for $TARGET"
             }
 
-            # 3. Удаляем старый тег, если есть (пересоздание)
+            # 4. Удаляем старый тег, если есть
             git tag -d "$TARGET" 2>/dev/null || true
             git push origin ":refs/tags/${TARGET}" 2>/dev/null || true
 
-            # 4. Создаём новый тег на свежем коде с патчем
+            # 5. Создаём новый тег
             git tag "$TARGET"
-            git push origin "$TARGET" || { echo "Push failed: $TARGET"; continue; }
+            git push origin "$TARGET" || { echo "❌ Push failed: $TARGET"; continue; }
             echo "✅ Tag pushed: $TARGET"
 
+            # 6. Создаём GitHub Release
+            {
+              echo "Fork of ${UPSTREAM_REPO}, based on ${TAG}."
+              echo
+              echo "Removed ${BLOCKED_PATTERN} from the hardcoded WAF referer blocklist."
+              echo "Upstream WAF blocks it unconditionally with no way to disable via settings."
+            } > release_notes.md
+
+            gh release create "$TARGET" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${TARGET} — Bylampa unblocked" \
+              --notes-file release_notes.md \
+              --latest
+
+            echo "✅ Release created: $TARGET"
             sleep 5
           done
 
-          # Пушим master и возвращаемся
+          # Пушим master
           git push origin master
           git checkout master 2>/dev/null || true
