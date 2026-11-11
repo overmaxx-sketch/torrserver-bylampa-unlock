@@ -16,7 +16,6 @@ var defaultBlockedReferers = []string{
 	"abhq.ru",
 	"abmsx.tech",
 	"akter.black",
-	"bylampa.online",
 	"lampa.click",
 	"lampa.land",
 	"lampa1.ru",

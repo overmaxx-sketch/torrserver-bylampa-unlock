@@ -1,3 +1,20 @@
+# TorrServer Bylampa Unlock
+
+Unofficial TorrServer fork with a Bylampa WAF patch.
+
+## About this fork
+
+Based on the official YouROK/TorrServer project.
+
+- Bylampa referer restriction patch
+- Automated upstream release synchronization
+- Separate Bylampa release tags
+
+Original project:
+https://github.com/YouROK/TorrServer
+
+---
+
 <p align="center" style="text-align: center">
   <img src="https://github.com/YouROK/TorrServer/assets/144587546/53f7175a-cda4-4a06-86b6-2ac07582dcf1" width="33%"><br/>
 </p>

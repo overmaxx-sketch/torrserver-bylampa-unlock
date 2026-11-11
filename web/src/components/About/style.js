@@ -27,6 +27,10 @@ export const HeaderSection = styled.section`
       width: 60px;
     }
   }
+
+  ${standaloneMedia(css`
+    padding-top: 30px;
+  `)}
 `
 
 export const ThanksSection = styled.section`

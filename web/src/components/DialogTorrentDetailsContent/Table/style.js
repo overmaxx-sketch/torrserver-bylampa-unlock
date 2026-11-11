@@ -76,12 +76,8 @@ export const TableStyle = styled.table`
 
     .button-cell {
       display: grid;
-      grid-auto-flow: column;
-      grid-auto-columns: max-content;
-      justify-content: start;
-      align-items: center;
+      grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
       gap: 10px;
-      white-space: nowrap;
     }
 
     @media (max-width: 970px) {
