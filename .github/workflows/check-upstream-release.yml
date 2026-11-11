@@ -338,7 +338,7 @@ jobs:
 
             git diff --cached --check
 
-            git commit \
+            git commit --allow-empty \
               -m "Release ${TARGET} (upstream ${TAG} + Bylampa patch)"
 
             # Создаём уникальный тег. Существующий удалённый тег
