@@ -1,0 +1,384 @@
+name: Sync Upstream Release
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 */1 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-release-check
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: "YouROK/TorrServer"
+  MIN_VERSION: "MatriX.144.1"
+  PATCH_FILE: "server/web/waf/referer.go"
+  BLOCKED_PATTERN: "bylampa"
+  DOCKER_WORKFLOW: ".github/workflows/docker_image.yml"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Не запускаем синхронизацию во время сборок
+      - name: Check dependent workflows
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          for wf in "ts_release.yml" "docker_image.yml"; do
+            ACTIVE=$(
+              gh run list \
+                --workflow="$wf" \
+                --repo "$GITHUB_REPOSITORY" \
+                --limit 100 \
+                --json status \
+                --jq '[.[] | select(
+                  .status == "in_progress" or
+                  .status == "queued"
+                )] | length'
+            )
+
+            if [ "$ACTIVE" -gt 0 ]; then
+              echo "::notice::Workflow $wf is busy ($ACTIVE run(s))."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      # 2. Получаем репозиторий и настраиваем Git
+      - name: Checkout
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Configure Git
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "bylampa-bot"
+          git config user.email "actions@github.com"
+
+          git remote set-url origin \
+            "https://x-access-token:${PAT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git remote add upstream \
+            "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+
+          git fetch origin master
+          git checkout master
+          git pull --ff-only origin master
+
+      # 3. Ищем все пропущенные стабильные релизы
+      - name: Find missing upstream releases
+        if: steps.guard.outputs.skip != 'true'
+        id: missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          ALL_TAGS=$(
+            gh api --paginate \
+              "repos/${UPSTREAM_REPO}/releases?per_page=100" \
+              --jq '.[] | select(.prerelease == false) | .tag_name'
+          )
+
+          FILTERED_TAGS=$(
+            printf '%s\n' "$ALL_TAGS" |
+              grep -E '^MatriX\.' |
+              sort -Vu || true
+          )
+
+          MISSING=""
+          LATEST=""
+
+          while IFS= read -r TAG; do
+            [ -n "$TAG" ] || continue
+
+            # Оставляем только версии начиная с MIN_VERSION
+            OLDEST=$(
+              printf '%s\n%s\n' "$MIN_VERSION" "$TAG" |
+                sort -V |
+                head -n 1
+            )
+
+            if [ "$OLDEST" != "$MIN_VERSION" ]; then
+              echo "Skipping older version: $TAG"
+              continue
+            fi
+
+            LATEST="$TAG"
+          done <<< "$FILTERED_TAGS"
+
+          if [ -z "$LATEST" ]; then
+            echo "::error::No upstream releases found >= $MIN_VERSION"
+            exit 1
+          fi
+
+          EXISTING_TAGS=$(
+            git ls-remote --tags origin |
+              awk '{print $2}'
+          )
+
+          while IFS= read -r TAG; do
+            [ -n "$TAG" ] || continue
+
+            OLDEST=$(
+              printf '%s\n%s\n' "$MIN_VERSION" "$TAG" |
+                sort -V |
+                head -n 1
+            )
+
+            [ "$OLDEST" = "$MIN_VERSION" ] || continue
+
+            TARGET="${TAG}-bylampa"
+
+            if printf '%s\n' "$EXISTING_TAGS" |
+                grep -qFx "refs/tags/${TARGET}"; then
+
+              if gh release view "$TARGET" \
+                  --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "Already published: $TARGET"
+                continue
+              fi
+
+              echo "Tag exists; release needs to be created: $TARGET"
+            else
+              echo "Missing tag: $TARGET"
+            fi
+
+            MISSING="${MISSING}${TAG}"$'\n'
+          done <<< "$FILTERED_TAGS"
+
+          {
+            echo "tags<<EOF"
+            printf '%s' "$MISSING"
+            echo "EOF"
+            echo "latest=$LATEST"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -z "$MISSING" ]; then
+            echo "All eligible releases already have tags and releases."
+          else
+            echo "Missing upstream versions:"
+            printf '%s' "$MISSING"
+          fi
+
+      # 4. Создаём отдельные релизы Bylampa
+      - name: Build and publish missing releases
+        if: >-
+          steps.guard.outputs.skip != 'true' &&
+          steps.missing.outputs.tags != ''
+        shell: bash
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TAGS: ${{ steps.missing.outputs.tags }}
+          LATEST_UPSTREAM_TAG: ${{ steps.missing.outputs.latest }}
+        run: |
+          set -euo pipefail
+
+          # Сохраняем собственные workflow форка:
+          # upstream не должен удалить нашу автоматизацию.
+          mkdir -p "$RUNNER_TEMP/bylampa-workflows"
+
+          if [ -d .github/workflows ]; then
+            cp -a .github/workflows/. \
+              "$RUNNER_TEMP/bylampa-workflows/"
+          fi
+
+          git fetch upstream --tags
+
+          LATEST_CREATED=false
+
+          # Список отсортирован по версии от старой к новой.
+          while IFS= read -r TAG; do
+            [ -n "$TAG" ] || continue
+
+            TARGET="${TAG}-bylampa"
+
+            echo "::group::Processing $TARGET"
+
+            # Если тег уже опубликован, но Release отсутствует,
+            # создаём только Release, не перезаписывая тег.
+            if git ls-remote --exit-code --tags origin \
+                "refs/tags/${TARGET}" >/dev/null 2>&1; then
+
+              if ! gh release view "$TARGET" \
+                  --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+
+                {
+                  echo "Fork of ${UPSTREAM_REPO}, based on ${TAG}."
+                  echo
+                  echo "Bylampa-specific TorrServer release."
+                  echo "The WAF referer restriction for Bylampa was patched."
+                } > release_notes.md
+
+                gh release create "$TARGET" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --title "${TARGET} — Bylampa unblocked" \
+                  --notes-file release_notes.md \
+                  --verify-tag
+
+                echo "Release recreated: $TARGET"
+              else
+                echo "Already published: $TARGET"
+              fi
+
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Начинаем с исходников конкретного upstream-тега.
+            git fetch upstream "$TAG"
+            UPSTREAM_COMMIT="$(git rev-parse FETCH_HEAD)"
+
+            # Удаляем файлы предыдущей версии, которых больше
+            # нет в upstream, не затрагивая workflow форка.
+            git ls-tree -r --name-only "$UPSTREAM_COMMIT" |
+              sort -u > "$RUNNER_TEMP/upstream-files.txt"
+
+            git ls-files |
+              grep -v '^\.github/workflows/' |
+              sort -u > "$RUNNER_TEMP/current-files.txt" || true
+
+            comm -23 \
+              "$RUNNER_TEMP/current-files.txt" \
+              "$RUNNER_TEMP/upstream-files.txt" |
+              while IFS= read -r FILE; do
+                [ -n "$FILE" ] || continue
+                git rm -f -- "$FILE"
+              done
+
+            # Обновляем дерево файлами нужной версии upstream.
+            git checkout "$UPSTREAM_COMMIT" -- .
+
+            # Восстанавливаем workflow форка.
+            mkdir -p .github/workflows
+            cp -a "$RUNNER_TEMP/bylampa-workflows/." \
+              .github/workflows/
+
+            # Добавляем описание форка в README.
+            if [ -f README.md ]; then
+              {
+                cat <<'EOF'
+          # TorrServer Bylampa Unlock
+
+          Unofficial TorrServer fork with a Bylampa WAF patch.
+
+          ## About this fork
+
+          Based on the official YouROK/TorrServer project.
+
+          - Bylampa referer restriction patch
+          - Automated upstream release synchronization
+          - Separate Bylampa release tags
+
+          Original project:
+          https://github.com/YouROK/TorrServer
+
+          ---
+
+          EOF
+                cat README.md
+              } > README.tmp
+
+              mv README.tmp README.md
+            fi
+
+            # Отключаем триггер Docker workflow по push в master.
+            # Изменяются только строки, соответствующие этим шаблонам.
+            if [ -f "$DOCKER_WORKFLOW" ]; then
+              sed -i '/branches:.*master/d' "$DOCKER_WORKFLOW"
+              sed -i '/^[[:space:]]*- master[[:space:]]*$/d' \
+                "$DOCKER_WORKFLOW"
+            fi
+
+            # Применяем патч WAF.
+            if [ ! -f "$PATCH_FILE" ]; then
+              echo "::error::Missing WAF file: $PATCH_FILE"
+              exit 1
+            fi
+
+            if ! grep -qi "$BLOCKED_PATTERN" "$PATCH_FILE"; then
+              echo "::error::Expected WAF pattern not found: $BLOCKED_PATTERN"
+              exit 1
+            fi
+
+            sed -i "/${BLOCKED_PATTERN}/Id" "$PATCH_FILE"
+
+            if grep -qi "$BLOCKED_PATTERN" "$PATCH_FILE"; then
+              echo "::error::WAF patch verification failed for $TAG"
+              exit 1
+            fi
+
+            echo "WAF patch verified."
+
+            # Проверяем синтаксис всех workflow перед коммитом.
+            git add -A
+
+            git diff --cached --check
+
+            git commit \
+              -m "Release ${TARGET} (upstream ${TAG} + Bylampa patch)"
+
+            # Создаём уникальный тег. Существующий удалённый тег
+            # никогда не удаляем автоматически.
+            git tag -d "$TARGET" 2>/dev/null || true
+            git tag "$TARGET"
+
+            git push origin "refs/tags/${TARGET}"
+
+            echo "Tag pushed: $TARGET"
+
+            # Создаём Release только после успешной публикации тега.
+            {
+              echo "Fork of ${UPSTREAM_REPO}, based on ${TAG}."
+              echo
+              echo "Removed the Bylampa-related WAF referer restriction."
+              echo "This release contains the Bylampa-specific patch."
+            } > release_notes.md
+
+            gh release create "$TARGET" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${TARGET} — Bylampa unblocked" \
+              --notes-file release_notes.md \
+              --verify-tag
+
+            echo "Release created: $TARGET"
+
+            if [ "$TAG" = "$LATEST_UPSTREAM_TAG" ]; then
+              LATEST_CREATED=true
+            fi
+
+            echo "::endgroup::"
+          done <<< "$TAGS"
+
+          # Обновляем master только если в этом запуске создан
+          # тег последней подходящей upstream-версии.
+          # Так старые пропущенные версии не откатят master назад.
+          if [ "$LATEST_CREATED" = true ]; then
+            git push origin HEAD:refs/heads/master
+            echo "master updated to the latest processed release."
+          else
+            echo "master was not changed: latest upstream tag was not created."
+          fi
